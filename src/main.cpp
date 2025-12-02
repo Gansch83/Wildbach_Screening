@@ -1,0 +1,656 @@
+#include <Arduino.h>
+#include <WiFi.h>  
+#include <Wire.h>
+#include <SSD1306Wire.h>
+#include <lmic.h>
+#include <hal/hal.h>
+#include <SPI.h>
+#include <Preferences.h>
+#include <CayenneLPP.h>
+
+// TTGO LoRa32 V1 Pin definitions
+#define LED_GREEN 25
+#define OLED_SDA 21
+#define OLED_SCL 22
+
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+
+// LoRa Radio pins
+#define LORA_SCK 5
+#define LORA_MISO 19
+#define LORA_MOSI 27
+#define LORA_CS 18
+#define LORA_RST 23
+#define LORA_DIO0 26
+#define LORA_DIO1 33
+#define LORA_DIO2 32
+
+// Water level config
+#define MAX_DISTANCE 400
+#define MIN_DISTANCE 2
+#define SENSOR_HEIGHT 200
+#define MEASUREMENT_INTERVAL 5000
+#define NUM_SAMPLES 5
+#define LORAWAN_TX_INTERVAL 60000
+
+// Sensor identification
+#define SENSOR_ID 1  // Change this for each sensor/device
+
+// Battery voltage measurement (ESP32 ADC)
+#define BATTERY_PIN 35  // ADC1_CH7 for battery voltage measurement
+#define BATTERY_VOLTAGE_DIVIDER 2.0  // Adjust based on your voltage divider
+
+// Test mode configuration
+#define TEST_MODE true  // Set to false when real sensor is connected
+#define TEST_WATER_LEVEL_BASE 50.0  // Base water level in cm for test data
+#define TEST_VARIATION 15.0  // Random variation range (+/- cm)
+
+// Deep Sleep configuration
+#define ENABLE_DEEP_SLEEP true  // Set to false to disable deep sleep for testing
+#define DEEP_SLEEP_DURATION_SEC 300  // Sleep for 5 minutes (300 seconds)
+#define MEASUREMENTS_BEFORE_SLEEP 1  // Number of measurements before sleeping
+#define OLED_TIMEOUT_MS 10000  // Turn off OLED after 10 seconds to save power
+
+// LoRaWAN ABP Configuration
+// These addresses and keys need to be configured in TTN Console
+// Device Address (4 bytes, MSB format)
+static const u4_t DEVADDR = 0x260B7689;  // Change this to your device address from TTN
+
+// Network Session Key (16 bytes, MSB format)
+static const u1_t PROGMEM NWKSKEY[16] = { 0xF7, 0xDE, 0x11, 0x6A, 0xCE, 0xC2, 0xEB, 0x74, 0x82, 0xE7, 0x1D, 0xA9, 0xE3, 0x7A, 0xC3, 0x1D };
+
+// Application Session Key (16 bytes, MSB format)
+static const u1_t PROGMEM APPSKEY[16] = { 0x90, 0x39, 0xFD, 0x26, 0x35, 0x61, 0x37, 0xE4, 0x91, 0x37, 0x71, 0xD9, 0x55, 0x3E, 0x37, 0xA5 };
+
+// These callbacks are required but not used with ABP
+void os_getArtEui (u1_t* buf) { }
+void os_getDevEui (u1_t* buf) { }
+void os_getDevKey (u1_t* buf) { }
+
+const lmic_pinmap lmic_pins = { 
+  .nss = LORA_CS, 
+  .rxtx = LMIC_UNUSED_PIN, 
+  .rst = LORA_RST, 
+  .dio = { LORA_DIO0, LORA_DIO1, LORA_DIO2 } 
+};
+
+// Global objects
+SSD1306Wire display(0x3c, OLED_SDA, OLED_SCL);
+CayenneLPP lpp(51);
+Preferences preferences;
+
+// Global variables
+static osjob_t sendjob;
+unsigned long lastMeasurement = 0;
+unsigned long lastTxTime = 0;
+unsigned long oledOnTime = 0;
+bool oledActive = true;
+int measurementCount = 0;
+float lastWaterLevel = 0.0;
+float lastBatteryVoltage = 0.0;
+bool joined = false;
+
+// Averaging variables
+#define AVG_SAMPLES 5
+float waterLevelSamples[AVG_SAMPLES];
+float batterySamples[AVG_SAMPLES];
+int sampleIndex = 0;
+
+// RTC memory to persist data across deep sleep
+RTC_DATA_ATTR int bootCount = 0;
+RTC_DATA_ATTR uint32_t lastTxSeqno = 0;
+
+// Function prototypes
+void displayInit();
+void displayUpdate(String line1, String line2, String line3, String line4);
+void displayOff();
+float measureWaterLevel();
+float readBatteryVoltage();
+void sendLoRaWANData(float waterLevel, float batteryVoltage);
+void do_send(osjob_t* j);
+void collectSamples(osjob_t* j);
+void onEvent(ev_t ev);
+void goToDeepSleep();
+void printDeviceInfo();
+void printMeasurement(float waterLevel, float batteryVoltage);
+void printLoRaWANStatus(const char* status);
+float calculateAverage(float* samples, int count);
+int getSpreadingFactor(rps_t rps);
+int getBandwidth(rps_t rps);
+
+// ============================================================================
+// OLED Display Functions
+// ============================================================================
+
+void displayInit() {
+  Serial.println(F("[OLED] Initializing display..."));
+  display.init();
+  display.flipScreenVertically();
+  display.setFont(ArialMT_Plain_10);
+  display.clear();
+  display.drawString(0, 0, "Water Level Monitor");
+  display.drawString(0, 15, "Sensor ID: " + String(SENSOR_ID));
+  display.drawString(0, 30, "ABP Mode");
+  display.drawString(0, 45, "Initializing...");
+  display.display();
+  oledOnTime = millis();
+  oledActive = true;
+  Serial.println(F("[OLED] Display initialized"));
+}
+
+void displayUpdate(String line1, String line2, String line3, String line4) {
+  if (!oledActive) {
+    display.displayOn();
+    oledActive = true;
+    Serial.println(F("[OLED] Display turned ON"));
+  }
+  
+  display.clear();
+  display.drawString(0, 0, line1);
+  display.drawString(0, 15, line2);
+  display.drawString(0, 30, line3);
+  display.drawString(0, 45, line4);
+  display.display();
+  oledOnTime = millis();
+}
+
+void displayOff() {
+  if (oledActive) {
+    display.displayOff();
+    oledActive = false;
+    Serial.println(F("[OLED] Display turned OFF to save power"));
+  }
+}
+
+// ============================================================================
+// Sensor Functions
+// ============================================================================
+
+float measureWaterLevel() {
+  Serial.println(F("\n[SENSOR] Starting water level measurement..."));
+  
+  if (TEST_MODE) {
+    // Generate test data with random variation
+    float variation = (random(-100, 100) / 100.0) * TEST_VARIATION;
+    float testLevel = TEST_WATER_LEVEL_BASE + variation;
+    Serial.println(F("[SENSOR] TEST MODE - Generating simulated data"));
+    Serial.printf("[SENSOR] Base level: %.2f cm, Variation: %.2f cm\n", TEST_WATER_LEVEL_BASE, variation);
+    Serial.printf("[SENSOR] Simulated water level: %.2f cm\n", testLevel);
+    delay(100); // Simulate sensor reading time
+    return testLevel;
+  }
+  
+  // Real sensor implementation would go here
+  // For now, return 0 if not in test mode
+  Serial.println(F("[SENSOR] Real sensor not implemented yet"));
+  return 0.0;
+}
+
+float readBatteryVoltage() {
+  Serial.println(F("[BATTERY] Reading battery voltage..."));
+  
+  // Read ADC value (12-bit: 0-4095)
+  int adcValue = analogRead(BATTERY_PIN);
+  
+  // Convert to voltage (ESP32 ADC reference is 3.3V but may need calibration)
+  // With voltage divider, actual battery voltage is multiplied by divider ratio
+  float voltage = (adcValue / 4095.0) * 3.3 * BATTERY_VOLTAGE_DIVIDER;
+  
+  Serial.printf("[BATTERY] ADC Value: %d\n", adcValue);
+  Serial.printf("[BATTERY] Battery Voltage: %.2f V\n", voltage);
+  
+  return voltage;
+}
+
+// ============================================================================
+// LoRaWAN Functions
+// ============================================================================
+
+void sendLoRaWANData(float waterLevel, float batteryVoltage) {
+  Serial.println(F("\n[LORAWAN] Preparing data for transmission..."));
+  
+  // Clear the buffer
+  lpp.reset();
+  
+  // Add sensor data using CayenneLPP format
+  // Channel 1: Water level (distance) in cm - using analog input type
+  lpp.addAnalogInput(1, waterLevel);
+  
+  // Channel 2: Battery voltage in V - using analog input type
+  lpp.addAnalogInput(2, batteryVoltage);
+  
+  Serial.printf("[LORAWAN] Payload created - Size: %d bytes\n", lpp.getSize());
+  Serial.print(F("[LORAWAN] Payload (hex): "));
+  for (int i = 0; i < lpp.getSize(); i++) {
+    Serial.printf("%02X ", lpp.getBuffer()[i]);
+  }
+  Serial.println();
+  Serial.printf("[LORAWAN] Data - Water Level: %.2f cm, Battery: %.2f V\n", 
+                waterLevel, batteryVoltage);
+  
+  // Schedule transmission
+  if (LMIC.opmode & OP_TXRXPEND) {
+    Serial.println(F("[LORAWAN] Warning: TX/RX pending, not sending"));
+    printLoRaWANStatus("TX Busy");
+  } else {
+    // Print current transmission parameters
+    Serial.println(F("[LORAWAN] Transmission Parameters:"));
+    Serial.printf("  Data Rate: SF%d", getSpreadingFactor(LMIC.datarate) + 7);
+    Serial.printf(" BW%dkHz\n", getBandwidth(LMIC.datarate));
+    Serial.printf("  TX Power: %d dBm\n", LMIC.txpow);
+    Serial.printf("  Frequency: %.3f MHz\n", LMIC.freq / 1000000.0);
+    
+    // Prepare upstream data transmission
+    // Last parameter: 0 = unconfirmed, 1 = confirmed (requests ACK)
+    LMIC_setTxData2(1, lpp.getBuffer(), lpp.getSize(), 1);  // Changed to confirmed
+    Serial.println(F("[LORAWAN] Packet queued for transmission (confirmed)"));
+    printLoRaWANStatus("TX Queued");
+  }
+}
+
+void collectSamples(osjob_t* j) {
+  Serial.printf("[AVERAGING] Collecting sample %d/%d...\n", sampleIndex + 1, AVG_SAMPLES);
+  
+  // Take measurement
+  waterLevelSamples[sampleIndex] = measureWaterLevel();
+  batterySamples[sampleIndex] = readBatteryVoltage();
+  
+  Serial.printf("[AVERAGING] Sample %d - Water: %.2f cm, Battery: %.2f V\n", 
+                sampleIndex + 1, waterLevelSamples[sampleIndex], batterySamples[sampleIndex]);
+  
+  // Update display with progress
+  displayUpdate(
+    "Sensor ID: " + String(SENSOR_ID),
+    "Sampling " + String(sampleIndex + 1) + "/" + String(AVG_SAMPLES),
+    "Water: " + String(waterLevelSamples[sampleIndex], 1) + " cm",
+    "Battery: " + String(batterySamples[sampleIndex], 2) + " V"
+  );
+  
+  sampleIndex++;
+  
+  if (sampleIndex < AVG_SAMPLES) {
+    // Schedule next sample in 2 seconds
+    Serial.println(F("[AVERAGING] Scheduling next sample in 2 seconds..."));
+    os_setTimedCallback(&sendjob, os_getTime() + sec2osticks(2), collectSamples);
+  } else {
+    // All samples collected, calculate averages and send
+    Serial.println(F("\n[AVERAGING] All samples collected. Calculating averages..."));
+    
+    lastWaterLevel = calculateAverage(waterLevelSamples, AVG_SAMPLES);
+    lastBatteryVoltage = calculateAverage(batterySamples, AVG_SAMPLES);
+    
+    Serial.printf("[AVERAGING] Average Water Level: %.2f cm\n", lastWaterLevel);
+    Serial.printf("[AVERAGING] Average Battery Voltage: %.2f V\n", lastBatteryVoltage);
+    
+    // Reset sample index for next cycle
+    sampleIndex = 0;
+    
+    // Call the actual send function
+    do_send(j);
+  }
+}
+
+void do_send(osjob_t* j) {
+  // Check if there is not a current TX/RX job running
+  if (LMIC.opmode & OP_TXRXPEND) {
+    Serial.println(F("[LORAWAN] OP_TXRXPEND, not sending"));
+  } else {
+    printMeasurement(lastWaterLevel, lastBatteryVoltage);
+    
+    // Send data via LoRaWAN
+    sendLoRaWANData(lastWaterLevel, lastBatteryVoltage);
+    
+    // Update display
+    displayUpdate(
+      "Sensor ID: " + String(SENSOR_ID),
+      "Water: " + String(lastWaterLevel, 1) + " cm",
+      "Battery: " + String(lastBatteryVoltage, 2) + " V",
+      "Sending..."
+    );
+  }
+}
+
+void onEvent(ev_t ev) {
+  Serial.print(F("[LORAWAN] Event: "));
+  Serial.print(os_getTime());
+  Serial.print(F(": "));
+  
+  switch(ev) {
+    case EV_SCAN_TIMEOUT:
+      Serial.println(F("EV_SCAN_TIMEOUT"));
+      printLoRaWANStatus("Scan Timeout");
+      break;
+      
+    case EV_BEACON_FOUND:
+      Serial.println(F("EV_BEACON_FOUND"));
+      break;
+      
+    case EV_BEACON_MISSED:
+      Serial.println(F("EV_BEACON_MISSED"));
+      break;
+      
+    case EV_BEACON_TRACKED:
+      Serial.println(F("EV_BEACON_TRACKED"));
+      break;
+      
+    case EV_JOINING:
+      Serial.println(F("EV_JOINING - Should not happen with ABP"));
+      break;
+      
+    case EV_JOINED:
+      Serial.println(F("EV_JOINED - Should not happen with ABP"));
+      break;
+      
+    case EV_JOIN_FAILED:
+      Serial.println(F("EV_JOIN_FAILED - Should not happen with ABP"));
+      break;
+      
+    case EV_REJOIN_FAILED:
+      Serial.println(F("EV_REJOIN_FAILED - Should not happen with ABP"));
+      break;
+      
+    case EV_TXCOMPLETE:
+      Serial.println(F("EV_TXCOMPLETE - Transmission complete"));
+      digitalWrite(LED_GREEN, LOW);
+      
+      if (LMIC.txrxFlags & TXRX_ACK) {
+        Serial.println(F("[LORAWAN] Received ACK"));
+        printLoRaWANStatus("TX OK + ACK");
+        displayUpdate(
+          "Sensor ID: " + String(SENSOR_ID),
+          "Water: " + String(lastWaterLevel, 1) + " cm",
+          "Battery: " + String(lastBatteryVoltage, 2) + " V",
+          "Sent + ACK"
+        );
+      } else {
+        Serial.println(F("[LORAWAN] No ACK received"));
+        printLoRaWANStatus("TX OK");
+        displayUpdate(
+          "Sensor ID: " + String(SENSOR_ID),
+          "Water: " + String(lastWaterLevel, 1) + " cm",
+          "Battery: " + String(lastBatteryVoltage, 2) + " V",
+          "Sent (No ACK)"
+        );
+      }
+      
+      if (LMIC.dataLen) {
+        Serial.printf("[LORAWAN] Received %d bytes of payload\n", LMIC.dataLen);
+        Serial.print(F("[LORAWAN] Data: "));
+        for (int i = 0; i < LMIC.dataLen; i++) {
+          Serial.printf("%02X ", LMIC.frame[LMIC.dataBeg + i]);
+        }
+        Serial.println();
+      }
+      
+      lastTxTime = millis();
+      measurementCount++;
+      
+      Serial.printf("[STATS] Total transmissions: %d\n", measurementCount);
+      
+      // Check if deep sleep should be enabled
+      if (ENABLE_DEEP_SLEEP && measurementCount >= MEASUREMENTS_BEFORE_SLEEP) {
+        Serial.println(F("\n[SLEEP] Preparing for deep sleep..."));
+        delay(1000); // Give time for serial output
+        goToDeepSleep();
+      } else {
+        // Schedule next measurement collection cycle
+        Serial.printf("[LORAWAN] Next measurement cycle in %d seconds\n", LORAWAN_TX_INTERVAL / 1000);
+        os_setTimedCallback(&sendjob, os_getTime() + sec2osticks(LORAWAN_TX_INTERVAL / 1000), collectSamples);
+      }
+      break;
+      
+    case EV_LOST_TSYNC:
+      Serial.println(F("EV_LOST_TSYNC"));
+      break;
+      
+    case EV_RESET:
+      Serial.println(F("EV_RESET"));
+      break;
+      
+    case EV_RXCOMPLETE:
+      Serial.println(F("EV_RXCOMPLETE"));
+      break;
+      
+    case EV_LINK_DEAD:
+      Serial.println(F("EV_LINK_DEAD"));
+      printLoRaWANStatus("Link Dead");
+      break;
+      
+    case EV_LINK_ALIVE:
+      Serial.println(F("EV_LINK_ALIVE"));
+      printLoRaWANStatus("Link Alive");
+      break;
+      
+    case EV_TXSTART:
+      Serial.println(F("EV_TXSTART - Starting transmission"));
+      Serial.println(F("[LORAWAN] ========================================"));
+      Serial.println(F("[LORAWAN]          TRANSMISSION DETAILS"));
+      Serial.println(F("[LORAWAN] ========================================"));
+      Serial.printf("[LORAWAN] Frequency: %.3f MHz\n", LMIC.freq / 1000000.0);
+      Serial.printf("[LORAWAN] Data Rate: SF%d", getSpreadingFactor(LMIC.datarate) + 7);
+      Serial.printf(" BW%dkHz\n", getBandwidth(LMIC.datarate));
+      Serial.printf("[LORAWAN] TX Power: %d dBm\n", LMIC.txpow);
+      Serial.printf("[LORAWAN] Channel: %d\n", LMIC.txChnl);
+      Serial.printf("[LORAWAN] Frame Counter: %d\n", LMIC.seqnoUp);
+      Serial.println(F("[LORAWAN] ========================================"));
+      printLoRaWANStatus("Transmitting");
+      digitalWrite(LED_GREEN, HIGH);
+      break;
+      
+    case EV_TXCANCELED:
+      Serial.println(F("EV_TXCANCELED"));
+      printLoRaWANStatus("TX Canceled");
+      digitalWrite(LED_GREEN, LOW);
+      break;
+      
+    case EV_RXSTART:
+      Serial.println(F("EV_RXSTART"));
+      break;
+      
+    case EV_JOIN_TXCOMPLETE:
+      Serial.println(F("EV_JOIN_TXCOMPLETE - Join request sent, no response yet"));
+      printLoRaWANStatus("Join TX Done");
+      break;
+      
+    default:
+      Serial.print(F("Unknown event: "));
+      Serial.println((unsigned) ev);
+      break;
+  }
+}
+
+// ============================================================================
+// Deep Sleep Functions
+// ============================================================================
+
+void goToDeepSleep() {
+  Serial.println(F("\n========================================"));
+  Serial.println(F("[SLEEP] Entering Deep Sleep Mode"));
+  Serial.println(F("========================================"));
+  Serial.printf("[SLEEP] Sleep duration: %d seconds\n", DEEP_SLEEP_DURATION_SEC);
+  Serial.printf("[SLEEP] Boot count: %d\n", bootCount);
+  Serial.printf("[SLEEP] Measurements this session: %d\n", measurementCount);
+  
+  // Save session data to RTC memory
+  lastTxSeqno = LMIC.seqnoUp;
+  bootCount++;
+  
+  Serial.println(F("[SLEEP] Session data saved to RTC memory"));
+  
+  // Turn off OLED to save power
+  displayOff();
+  
+  // Turn off LED
+  digitalWrite(LED_GREEN, LOW);
+  
+  // Configure wake-up timer
+  esp_sleep_enable_timer_wakeup(DEEP_SLEEP_DURATION_SEC * 1000000ULL);
+  Serial.println(F("[SLEEP] Wake-up timer configured"));
+  
+  Serial.println(F("[SLEEP] Going to sleep now..."));
+  Serial.flush();
+  
+  // Enter deep sleep
+  esp_deep_sleep_start();
+}
+
+// ============================================================================
+// Utility Functions
+// ============================================================================
+
+void printDeviceInfo() {
+  Serial.println(F("\n========================================"));
+  Serial.println(F("   WATER LEVEL MONITORING SYSTEM"));
+  Serial.println(F("========================================"));
+  Serial.printf("Sensor ID: %d\n", SENSOR_ID);
+  Serial.printf("Firmware Version: 1.0.0\n");
+  Serial.printf("Boot Count: %d\n", bootCount);
+  Serial.println(F("----------------------------------------"));
+  
+  Serial.println(F("Configuration:"));
+  Serial.printf("  Test Mode: %s\n", TEST_MODE ? "ENABLED" : "DISABLED");
+  Serial.printf("  Deep Sleep: %s\n", ENABLE_DEEP_SLEEP ? "ENABLED" : "DISABLED");
+  if (ENABLE_DEEP_SLEEP) {
+    Serial.printf("  Sleep Duration: %d seconds\n", DEEP_SLEEP_DURATION_SEC);
+    Serial.printf("  Measurements Before Sleep: %d\n", MEASUREMENTS_BEFORE_SLEEP);
+  }
+  Serial.printf("  TX Interval: %d seconds\n", LORAWAN_TX_INTERVAL / 1000);
+  Serial.printf("  OLED Timeout: %d seconds\n", OLED_TIMEOUT_MS / 1000);
+  Serial.println(F("----------------------------------------"));
+  
+  Serial.println(F("LoRaWAN ABP Credentials:"));
+  Serial.print(F("  DevAddr: 0x"));
+  Serial.println(DEVADDR, HEX);
+  Serial.print(F("  NwkSKey: "));
+  for (int i = 0; i < 16; i++) {
+    Serial.printf("%02X", NWKSKEY[i]);
+    if (i < 15) Serial.print("-");
+  }
+  Serial.println();
+  Serial.print(F("  AppSKey: "));
+  for (int i = 0; i < 16; i++) {
+    Serial.printf("%02X", APPSKEY[i]);
+    if (i < 15) Serial.print("-");
+  }
+  Serial.println();
+  Serial.println(F("========================================\n"));
+}
+
+void printMeasurement(float waterLevel, float batteryVoltage) {
+  Serial.println(F("\n========================================"));
+  Serial.println(F("         MEASUREMENT DATA"));
+  Serial.println(F("========================================"));
+  Serial.printf("Timestamp: %lu ms\n", millis());
+  Serial.printf("Measurement #: %d\n", measurementCount + 1);
+  Serial.println(F("----------------------------------------"));
+  Serial.printf("Water Level: %.2f cm\n", waterLevel);
+  Serial.printf("Battery Voltage: %.2f V\n", batteryVoltage);
+  Serial.printf("Sensor ID: %d\n", SENSOR_ID);
+  Serial.println(F("========================================\n"));
+}
+
+void printLoRaWANStatus(const char* status) {
+  Serial.println(F("----------------------------------------"));
+  Serial.printf("[LORAWAN] Status: %s\n", status);
+  Serial.println(F("----------------------------------------"));
+}
+
+float calculateAverage(float* samples, int count) {
+  float sum = 0.0;
+  for (int i = 0; i < count; i++) {
+    sum += samples[i];
+  }
+  return sum / count;
+}
+
+// Helper function to extract spreading factor from data rate
+int getSpreadingFactor(rps_t rps) {
+  return rps & 0x7;
+}
+
+// Helper function to extract bandwidth from data rate
+int getBandwidth(rps_t rps) {
+  switch ((rps >> 4) & 0x3) {
+    case 0: return 125;
+    case 1: return 250;
+    case 2: return 500;
+    default: return 125;
+  }
+}
+
+// ============================================================================
+// Setup and Loop
+// ============================================================================
+
+void setup() {
+  // Initialize serial communication
+  Serial.begin(115200);
+  delay(1000);
+  
+  // Print device information
+  printDeviceInfo();
+  
+  // Initialize LED
+  pinMode(LED_GREEN, OUTPUT);
+  digitalWrite(LED_GREEN, LOW);
+  Serial.println(F("[INIT] LED initialized"));
+  
+  // Initialize display
+  displayInit();
+  
+  // Initialize battery ADC
+  pinMode(BATTERY_PIN, INPUT);
+  analogReadResolution(12); // 12-bit resolution (0-4095)
+  Serial.println(F("[INIT] Battery monitoring initialized"));
+  
+  // Initialize SPI for LoRa
+  SPI.begin(LORA_SCK, LORA_MISO, LORA_MOSI, LORA_CS);
+  Serial.println(F("[INIT] SPI initialized"));
+  
+  // Initialize LoRaWAN
+  Serial.println(F("[INIT] Initializing LoRaWAN..."));
+  os_init();
+  LMIC_reset();
+  
+  // Set static session parameters for ABP
+  uint8_t appskey[sizeof(APPSKEY)];
+  uint8_t nwkskey[sizeof(NWKSKEY)];
+  memcpy_P(appskey, APPSKEY, sizeof(APPSKEY));
+  memcpy_P(nwkskey, NWKSKEY, sizeof(NWKSKEY));
+  LMIC_setSession(0x13, DEVADDR, nwkskey, appskey);
+  
+  // Set up LoRaWAN parameters
+  LMIC_setClockError(MAX_CLOCK_ERROR * 1 / 100);
+  
+  // Disable link check validation (not supported with ABP)
+  LMIC_setLinkCheckMode(0);
+  
+  // TTN uses SF9 for RX2 window
+  LMIC.dn2Dr = DR_SF9;
+  
+  // Set data rate and transmit power for uplink
+  LMIC_setDrTxpow(DR_SF7, 14);
+  
+  Serial.println(F("[INIT] ABP configuration complete"));
+  Serial.println(F("[INIT] Device is ready to transmit"));
+  
+  // Start collecting samples immediately
+  Serial.println(F("[INIT] Starting first measurement collection in 5 seconds..."));
+  os_setTimedCallback(&sendjob, os_getTime() + sec2osticks(5), collectSamples);
+  
+  Serial.println(F("\n[INIT] Setup complete - Starting main loop\n"));
+}
+
+void loop() {
+  // Process LoRaWAN events
+  os_runloop_once();
+  
+  // Turn off OLED after timeout to save power
+  if (oledActive && (millis() - oledOnTime > OLED_TIMEOUT_MS)) {
+    displayOff();
+  }
+  
+  // Add a small delay to prevent watchdog issues
+  delay(1);
+}
