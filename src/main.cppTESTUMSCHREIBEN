@@ -29,14 +29,14 @@
 // Water level config
 #define MAX_DISTANCE 400
 #define MIN_DISTANCE 2
-#define SENSOR_HEIGHT 200
+#define SENSOR_HEIGHT 100   // <--- ROHRDURCHMESSER auf 100cm 
 #define MEASUREMENT_INTERVAL 5000
 #define NUM_SAMPLES 5
 #define LORAWAN_TX_INTERVAL 60000
 
 // JSN-SR04T Sensor pins (Bitte Verkabelung prüfen)
-#define TRIGGER_PIN 13 ///Trigger Pin
-#define ECHO_PIN 12    ///Echo Pin
+#define TRIG_PIN 13 //Trigger Pin
+#define ECHO_PIN 12    //Echo Pin
 
 // Sensor identification
 #define SENSOR_ID 1  // Change this for each sensor/device
@@ -174,54 +174,27 @@ void displayOff() {
 float measureWaterLevel() {
   Serial.println(F("\n[SENSOR] Starting water level measurement..."));
   
-  // 1. Check for Test Mode first
   if (TEST_MODE) {
     float variation = (random(-100, 100) / 100.0) * TEST_VARIATION;
-    float testLevel = TEST_WATER_LEVEL_BASE + variation;
-    Serial.println(F("[SENSOR] TEST MODE - Generating simulated data"));
-    Serial.printf("[SENSOR] Base level: %.2f cm, Variation: %.2f cm\n", TEST_WATER_LEVEL_BASE, variation);
-    return testLevel;
+    return TEST_WATER_LEVEL_BASE + variation;
   }
   
-  // 2. Real Sensor Implementation (JSN-SR04T)
-  
-  // Ensure Trigger is Low
+  // --- ECHTE MESSUNG START ---
   digitalWrite(TRIG_PIN, LOW);
   delayMicroseconds(2);
-  
-  // Send 10µs High Pulse
   digitalWrite(TRIG_PIN, HIGH);
   delayMicroseconds(10);
   digitalWrite(TRIG_PIN, LOW);
   
-  // Measure the Echo duration (in microseconds)
-  // Timeout set to 30000µs (approx 5 meters) to prevent blocking if sensor fails
-  long duration = pulseIn(ECHO_PIN, HIGH, 30000);
+  long duration = pulseIn(ECHO_PIN, HIGH, 30000); // 30ms Timeout
   
-  if (duration == 0) {
-    Serial.println(F("[SENSOR] Error: Sensor timeout or out of range"));
-    return -1.0; // Return error code
-  }
+  if (duration == 0) return -1.0; // Fehler
   
-  // Calculate distance in cm (Speed of sound ~0.034 cm/µs)
   float distanceCm = duration * 0.034 / 2.0;
+  float realLevel = SENSOR_HEIGHT - distanceCm; // 100 - gemessener Abstand
   
-  // Calculate actual water fill level
-  // Water Level = Total Tank Height - Distance to Surface
-  float realLevel = SENSOR_HEIGHT - distanceCm;
-  
-  // Sanity checks
-  if (realLevel < 0) {
-    Serial.println(F("[SENSOR] Reading below 0 (Tank empty or sensor calibration needed)"));
-    realLevel = 0.0;
-  } else if (realLevel > SENSOR_HEIGHT) {
-     // Usually happens if object is closer than 20cm (blind zone)
-     Serial.println(F("[SENSOR] Reading > Height (Object in blind zone?)"));
-     realLevel = SENSOR_HEIGHT; 
-  }
-
-  Serial.printf("[SENSOR] Distance to surface: %.2f cm\n", distanceCm);
-  Serial.printf("[SENSOR] Calculated Water Level: %.2f cm\n", realLevel);
+  if (realLevel < 0) realLevel = 0.0;
+  if (realLevel > SENSOR_HEIGHT) realLevel = SENSOR_HEIGHT;
   
   return realLevel;
 }
@@ -638,7 +611,7 @@ void setup() {
   // Initialize JSN-SR04T Pins
   pinMode(TRIG_PIN, OUTPUT);
   pinMode(ECHO_PIN, INPUT);
-  digitalWrite(TRIG_PIN, LOW); // Ensure trigger is low
+  digitalWrite(TRIG_PIN, LOW);
   Serial.println(F("[INIT] JSN-SR04T Sensor initialized"));
 
   // Initialize display
